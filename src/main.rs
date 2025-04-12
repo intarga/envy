@@ -28,8 +28,44 @@ impl EditorState {
         let (cols, rows) = termion::terminal_size().unwrap();
 
         EditorState {
-            cursor_position: CursorPosition { col: 0, row: 0 },
+            cursor_position: CursorPosition { col: 1, row: 1 },
             term_size: TermSize { cols, rows },
+        }
+    }
+
+    fn cursor_left(&mut self) {
+        let in_first_col = self.cursor_position.col == 1;
+        let in_first_row = self.cursor_position.row == 1;
+
+        if !in_first_col {
+            self.cursor_position.col -= 1;
+        } else if !in_first_row {
+            self.cursor_position.row -= 1;
+            self.cursor_position.col = self.term_size.cols;
+        }
+    }
+
+    fn cursor_right(&mut self) {
+        let in_last_col = self.cursor_position.col == self.term_size.cols;
+        let in_last_row = self.cursor_position.row == self.term_size.rows;
+
+        if !in_last_col {
+            self.cursor_position.col += 1;
+        } else if !in_last_row {
+            self.cursor_position.row += 1;
+            self.cursor_position.col = 1;
+        }
+    }
+
+    fn cursor_up(&mut self) {
+        if self.cursor_position.row != 1 {
+            self.cursor_position.row -= 1;
+        }
+    }
+
+    fn cursor_down(&mut self) {
+        if self.cursor_position.row != self.term_size.rows {
+            self.cursor_position.row += 1;
         }
     }
 }
@@ -37,10 +73,10 @@ impl EditorState {
 fn process_keypress(key: Key, state: &mut EditorState) -> bool {
     match key {
         Key::Char('q') => return true,
-        Key::Left => state.cursor_position.col -= 1,
-        Key::Right => state.cursor_position.col += 1,
-        Key::Up => state.cursor_position.row -= 1,
-        Key::Down => state.cursor_position.row += 1,
+        Key::Left => state.cursor_left(),
+        Key::Right => state.cursor_right(),
+        Key::Up => state.cursor_up(),
+        Key::Down => state.cursor_down(),
         _ => (),
     }
 
@@ -51,7 +87,7 @@ fn render_editor(state: &EditorState, term: &mut Term) {
     write!(
         term,
         "{}",
-        termion::cursor::Goto(state.cursor_position.col + 1, state.cursor_position.row + 1)
+        termion::cursor::Goto(state.cursor_position.col, state.cursor_position.row)
     )
     .unwrap();
     term.flush().unwrap();
