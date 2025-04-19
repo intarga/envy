@@ -10,6 +10,8 @@ use termion::{
     screen::{AlternateScreen, IntoAlternateScreen},
 };
 
+const SCROLLOFF: usize = 5;
+
 type Term = AlternateScreen<RawTerminal<Stdout>>;
 
 struct CursorPosition {
@@ -29,6 +31,8 @@ struct TermSize {
 
 struct EditorState {
     file_text: Rope,
+    /// first line in file to draw
+    view_offset: usize,
     cursor_position: CursorPosition,
     term_size: TermSize,
 }
@@ -41,6 +45,7 @@ impl EditorState {
 
         EditorState {
             file_text,
+            view_offset: 0,
             cursor_position: CursorPosition {
                 char: 0,
                 target_col: None,
@@ -56,7 +61,7 @@ impl EditorState {
         let col = ((self.cursor_position.char - line_start) + 1)
             .try_into()
             .unwrap();
-        let row = (line + 1).try_into().unwrap();
+        let row = (line - self.view_offset + 1).try_into().unwrap();
 
         (col, row)
     }
@@ -138,6 +143,22 @@ impl EditorState {
             }
         }
     }
+
+    fn ensure_cursor_in_view(&mut self) {
+        let line = self.file_text.char_to_line(self.cursor_position.char);
+        let delta: isize = line as isize - self.view_offset as isize;
+
+        if line < SCROLLOFF {
+            return;
+        }
+
+        if delta < SCROLLOFF as isize {
+            self.view_offset -= (SCROLLOFF as isize - delta) as usize;
+        } else if delta > (self.term_size.rows as isize - SCROLLOFF as isize) {
+            self.view_offset +=
+                (delta - (self.term_size.rows as isize - SCROLLOFF as isize)) as usize
+        }
+    }
 }
 
 fn process_keypress(key: Key, state: &mut EditorState) -> bool {
@@ -159,6 +180,7 @@ fn render_editor(state: &EditorState, term: &mut Term) {
     for (line_num, line_text) in state
         .file_text
         .lines()
+        .skip(state.view_offset)
         // remove trailing newline
         .map(|line| line.slice(..(line.len_chars() - 1)))
         .enumerate()
@@ -210,6 +232,8 @@ fn main() {
 
     for c in stdin.keys() {
         let quit = process_keypress(c.unwrap(), &mut state);
+
+        state.ensure_cursor_in_view();
 
         if quit {
             break;
