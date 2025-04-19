@@ -126,6 +126,21 @@ fn main() {
         .into_alternate_screen()
         .unwrap();
 
+    write!(term, "{}", termion::cursor::Save).unwrap();
+
+    let panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut term = stdout();
+        // ignore error here because we are in panic recovery
+        let _ = write!(
+            term,
+            "{}{}",
+            termion::cursor::Restore,
+            termion::screen::ToMainScreen
+        );
+        panic_hook(info)
+    }));
+
     let path = std::env::args().skip(1).next().unwrap();
 
     let mut state = EditorState::new(path);
