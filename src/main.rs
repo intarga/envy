@@ -13,11 +13,16 @@ use termion::{
 type Term = AlternateScreen<RawTerminal<Stdout>>;
 
 struct CursorPosition {
-    col: u16,
-    row: u16,
+    /// Ropey char_idx (char in file cursor is on)
+    char: usize,
+    /// if a vertical move causes a change in cursor column (because the new line is too short)
+    /// this stores the original column so it can be restored on a subsequent vertical move
+    target_col: Option<u16>,
 }
 
 struct TermSize {
+    // TODO: remove
+    #[allow(dead_code)]
     cols: u16,
     rows: u16,
 }
@@ -36,44 +41,101 @@ impl EditorState {
 
         EditorState {
             file_text,
-            cursor_position: CursorPosition { col: 1, row: 1 },
+            cursor_position: CursorPosition {
+                char: 0,
+                target_col: None,
+            },
             term_size: TermSize { cols, rows },
         }
     }
 
-    fn cursor_left(&mut self) {
-        let in_first_col = self.cursor_position.col == 1;
-        let in_first_row = self.cursor_position.row == 1;
+    fn get_cursor_visual_pos(&self) -> (u16, u16) {
+        let line = self.file_text.char_to_line(self.cursor_position.char);
+        let line_start = self.file_text.line_to_char(line);
 
-        if !in_first_col {
-            self.cursor_position.col -= 1;
-        } else if !in_first_row {
-            self.cursor_position.row -= 1;
-            self.cursor_position.col = self.term_size.cols;
-        }
+        let col = ((self.cursor_position.char - line_start) + 1)
+            .try_into()
+            .unwrap();
+        let row = (line + 1).try_into().unwrap();
+
+        (col, row)
+    }
+
+    fn cursor_left(&mut self) {
+        self.cursor_position.char = self.cursor_position.char.saturating_sub(1);
+        self.cursor_position.target_col = None
     }
 
     fn cursor_right(&mut self) {
-        let in_last_col = self.cursor_position.col == self.term_size.cols;
-        let in_last_row = self.cursor_position.row == self.term_size.rows;
-
-        if !in_last_col {
-            self.cursor_position.col += 1;
-        } else if !in_last_row {
-            self.cursor_position.row += 1;
-            self.cursor_position.col = 1;
-        }
+        self.cursor_position.char =
+            (self.cursor_position.char + 1).min(self.file_text.len_chars() - 1);
+        self.cursor_position.target_col = None
     }
 
     fn cursor_up(&mut self) {
-        if self.cursor_position.row != 1 {
-            self.cursor_position.row -= 1;
+        let curr_line = self.file_text.char_to_line(self.cursor_position.char);
+        if curr_line < 1 {
+            return;
+        }
+
+        let start_of_curr_line = self.file_text.line_to_char(curr_line);
+        let start_of_prev_line = self.file_text.line_to_char(curr_line - 1);
+        let end_of_prev_line = start_of_curr_line - 1;
+
+        let curr_col: u16 = (self.cursor_position.char - start_of_curr_line)
+            .try_into()
+            .unwrap();
+        let target_col = self
+            .cursor_position
+            .target_col
+            .map_or(curr_col, |target_col| target_col.max(curr_col));
+
+        let optimistic_next_pos = start_of_prev_line + target_col as usize;
+
+        self.cursor_position = if optimistic_next_pos > end_of_prev_line {
+            CursorPosition {
+                char: end_of_prev_line,
+                target_col: Some(target_col),
+            }
+        } else {
+            CursorPosition {
+                char: optimistic_next_pos,
+                target_col: None,
+            }
         }
     }
 
+    // TODO: DRY potential with cursor_up
     fn cursor_down(&mut self) {
-        if self.cursor_position.row != self.term_size.rows {
-            self.cursor_position.row += 1;
+        let curr_line = self.file_text.char_to_line(self.cursor_position.char);
+        if !(curr_line < self.file_text.len_lines()) {
+            return;
+        }
+
+        let start_of_curr_line = self.file_text.line_to_char(curr_line);
+        let start_of_next_line = self.file_text.line_to_char(curr_line + 1);
+        let end_of_next_line = self.file_text.line_to_char(curr_line + 2) - 1;
+
+        let curr_col: u16 = (self.cursor_position.char - start_of_curr_line)
+            .try_into()
+            .unwrap();
+        let target_col = self
+            .cursor_position
+            .target_col
+            .map_or(curr_col, |target_col| target_col.max(curr_col));
+
+        let optimistic_next_pos = start_of_next_line + target_col as usize;
+
+        self.cursor_position = if optimistic_next_pos > end_of_next_line {
+            CursorPosition {
+                char: end_of_next_line,
+                target_col: Some(target_col),
+            }
+        } else {
+            CursorPosition {
+                char: optimistic_next_pos,
+                target_col: None,
+            }
         }
     }
 }
@@ -97,6 +159,8 @@ fn render_editor(state: &EditorState, term: &mut Term) {
     for (line_num, line_text) in state
         .file_text
         .lines()
+        // remove trailing newline
+        .map(|line| line.slice(..(line.len_chars() - 1)))
         .enumerate()
         .take(state.term_size.rows.into())
     {
@@ -109,12 +173,9 @@ fn render_editor(state: &EditorState, term: &mut Term) {
         .unwrap();
     }
 
-    write!(
-        term,
-        "{}",
-        termion::cursor::Goto(state.cursor_position.col, state.cursor_position.row)
-    )
-    .unwrap();
+    let (col, row) = state.get_cursor_visual_pos();
+    write!(term, "{}", termion::cursor::Goto(col, row)).unwrap();
+
     term.flush().unwrap();
 }
 
