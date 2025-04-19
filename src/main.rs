@@ -214,7 +214,7 @@ fn render_editor(state: &EditorState, term: &mut Term) {
         .lines()
         .skip(state.view_offset)
         // remove trailing newline
-        .map(|line| line.slice(..(line.len_chars() - 1)))
+        .map(|line| line.slice(..(line.len_chars().saturating_sub(1))))
         .enumerate()
         .take(state.term_size.rows.into())
     {
