@@ -1,7 +1,7 @@
 use ropey::Rope;
 use std::{
     fs::File,
-    io::{BufReader, Stdout, Write, stdin, stdout},
+    io::{self, BufReader, Stdout, Write, stdin, stdout},
 };
 use termion::{
     event::Key,
@@ -161,6 +161,38 @@ impl EditorState {
     }
 }
 
+fn init_tui() -> io::Result<Term> {
+    let mut term = stdout().into_raw_mode()?;
+    write!(term, "{}", termion::cursor::Save)?;
+    term.flush()?;
+    term.into_alternate_screen()
+}
+
+fn restore_tui() -> io::Result<()> {
+    write!(
+        stdout(),
+        "{}{}",
+        termion::screen::ToMainScreen,
+        termion::cursor::Restore
+    )?;
+    stdout().flush()?;
+    Ok(())
+}
+
+fn init_panic_hook() -> io::Result<()> {
+    let raw_output = stdout().into_raw_mode()?;
+    raw_output.suspend_raw_mode()?;
+
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // intentionally ignore errors here since we're already in a panic
+        let _ = raw_output.suspend_raw_mode();
+        let _ = restore_tui();
+        original_hook(panic_info);
+    }));
+    Ok(())
+}
+
 fn process_keypress(key: Key, state: &mut EditorState) -> bool {
     match key {
         Key::Char('q') => return true,
@@ -202,27 +234,10 @@ fn render_editor(state: &EditorState, term: &mut Term) {
 }
 
 fn main() {
+    init_panic_hook().unwrap();
+
     let stdin = stdin();
-    let mut term = stdout()
-        .into_raw_mode()
-        .unwrap()
-        .into_alternate_screen()
-        .unwrap();
-
-    write!(term, "{}", termion::cursor::Save).unwrap();
-
-    let panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let mut term = stdout();
-        // ignore error here because we are in panic recovery
-        let _ = write!(
-            term,
-            "{}{}",
-            termion::cursor::Restore,
-            termion::screen::ToMainScreen
-        );
-        panic_hook(info)
-    }));
+    let mut term = init_tui().unwrap();
 
     let path = std::env::args().skip(1).next().unwrap();
 
