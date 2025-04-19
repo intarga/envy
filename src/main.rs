@@ -1,4 +1,8 @@
-use std::io::{Stdout, Write, stdin, stdout};
+use ropey::Rope;
+use std::{
+    fs::File,
+    io::{BufReader, Stdout, Write, stdin, stdout},
+};
 use termion::{
     event::Key,
     input::TermRead,
@@ -19,15 +23,19 @@ struct TermSize {
 }
 
 struct EditorState {
+    file_text: Rope,
     cursor_position: CursorPosition,
     term_size: TermSize,
 }
 
 impl EditorState {
-    fn new() -> Self {
+    fn new(path: String) -> Self {
         let (cols, rows) = termion::terminal_size().unwrap();
 
+        let file_text = Rope::from_reader(BufReader::new(File::open(path).unwrap())).unwrap();
+
         EditorState {
+            file_text,
             cursor_position: CursorPosition { col: 1, row: 1 },
             term_size: TermSize { cols, rows },
         }
@@ -84,6 +92,23 @@ fn process_keypress(key: Key, state: &mut EditorState) -> bool {
 }
 
 fn render_editor(state: &EditorState, term: &mut Term) {
+    write!(term, "{}", termion::clear::All).unwrap();
+
+    for (line_num, line_text) in state
+        .file_text
+        .lines()
+        .enumerate()
+        .take(state.term_size.rows.into())
+    {
+        write!(
+            term,
+            "{}{}",
+            termion::cursor::Goto(1, (line_num + 1).try_into().unwrap()),
+            line_text
+        )
+        .unwrap();
+    }
+
     write!(
         term,
         "{}",
@@ -101,17 +126,11 @@ fn main() {
         .into_alternate_screen()
         .unwrap();
 
-    let mut state = EditorState::new();
+    let path = std::env::args().skip(1).next().unwrap();
 
-    write!(
-        term,
-        "{}q to exit{}",
-        termion::clear::All,
-        termion::cursor::Goto(1, 1),
-        // termion::cursor::Hide
-    )
-    .unwrap();
-    term.flush().unwrap();
+    let mut state = EditorState::new(path);
+
+    render_editor(&state, &mut term);
 
     for c in stdin.keys() {
         let quit = process_keypress(c.unwrap(), &mut state);
