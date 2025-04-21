@@ -1,7 +1,8 @@
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 use std::{
     fs::File,
     io::{self, BufReader, Stdout, Write, stdin, stdout},
+    ops::Add,
 };
 use termion::{
     event::Key,
@@ -23,8 +24,6 @@ struct CursorPosition {
 }
 
 struct TermSize {
-    // TODO: remove
-    #[allow(dead_code)]
     cols: u16,
     rows: u16,
 }
@@ -58,10 +57,21 @@ impl EditorState {
         let line = self.file_text.char_to_line(self.cursor_position.char);
         let line_start = self.file_text.line_to_char(line);
 
-        let col = ((self.cursor_position.char - line_start) + 1)
+        let col = (((self.cursor_position.char - line_start) % self.term_size.cols as usize) + 1)
             .try_into()
             .unwrap();
-        let row = (line - self.view_offset + 1).try_into().unwrap();
+
+        let visual_lines_above: u16 = (self.view_offset..line)
+            .map(|line_idx| {
+                (self.file_text.line(line_idx).len_chars() / self.term_size.cols as usize) + 1
+            })
+            .sum::<usize>()
+            .add(1)
+            .try_into()
+            .unwrap();
+        let breaks_in_curr_line =
+            (self.cursor_position.char - line_start) / self.term_size.cols as usize;
+        let row = visual_lines_above + breaks_in_curr_line as u16;
 
         (col, row)
     }
@@ -206,18 +216,64 @@ fn process_keypress(key: Key, state: &mut EditorState) -> bool {
     return false;
 }
 
-fn render_editor(state: &EditorState, term: &mut Term) {
-    write!(term, "{}", termion::clear::All).unwrap();
+// TODO: more descriptive name?
+fn layout(state: &EditorState) -> Vec<RopeSlice<'_>> {
+    let width = state.term_size.cols as usize;
+    let mut visual_lines = Vec::with_capacity(state.term_size.rows.into());
+    let mut push_count = 0;
 
-    for (line_num, line_text) in state
-        .file_text
-        .lines()
-        .skip(state.view_offset)
-        // remove trailing newline
-        .map(|line| line.slice(..(line.len_chars().saturating_sub(1))))
-        .enumerate()
-        .take(state.term_size.rows.into())
-    {
+    'outer: for line in state.file_text.lines().skip(state.view_offset) {
+        let line = line.slice(..(line.len_chars().saturating_sub(1)));
+        let wrap_count = (line.len_chars() / width) + 1;
+
+        // wrap at multiples of the viewport width, with 0 and line length as outer bounds
+        let breakpoints = (0..wrap_count)
+            .map(|i| i * width)
+            .chain(std::iter::once(line.len_chars()))
+            .collect::<Vec<usize>>();
+
+        // take breakpoints in pairs, since we slice from one point to the next
+        for points in breakpoints.windows(2) {
+            visual_lines.push(line.slice(points[0]..points[1]));
+            push_count += 1;
+
+            if push_count == state.term_size.rows.into() {
+                // we have enough visual lines to fill the viewport
+                break 'outer;
+            }
+        }
+    }
+
+    visual_lines
+}
+
+#[test]
+fn test_layout() {
+    let state = EditorState {
+        file_text: Rope::from_str("\n\n1234567\n1234\n\n"),
+        view_offset: 2,
+        cursor_position: CursorPosition {
+            char: 3,
+            target_col: None,
+        },
+        term_size: TermSize { cols: 3, rows: 5 },
+    };
+
+    let visual_lines = layout(&state);
+
+    assert_eq!(visual_lines.len(), 5);
+    assert_eq!(visual_lines[0], "123");
+    assert_eq!(visual_lines[1], "456");
+    assert_eq!(visual_lines[2], "7\n");
+    assert_eq!(visual_lines[3], "123");
+    assert_eq!(visual_lines[3], "4\n");
+}
+
+fn render_editor(state: &EditorState, term: &mut Term) {
+    let visual_lines = layout(state);
+
+    write!(term, "{}", termion::clear::All).unwrap();
+    for (line_num, line_text) in visual_lines.into_iter().enumerate() {
         write!(
             term,
             "{}{}",
