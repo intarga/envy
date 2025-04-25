@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 termion = "4.0.5"
 ropey = "1.6.1"
+itertools = "0.14.0"

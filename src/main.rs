@@ -1,8 +1,12 @@
+use itertools::{
+    FoldWhile::{Continue, Done},
+    Itertools,
+};
 use ropey::{Rope, RopeSlice};
 use std::{
     fs::File,
     io::{self, BufReader, Stdout, Write, stdin, stdout},
-    ops::Add,
+    ops::{Add, Sub},
 };
 use termion::{
     event::Key,
@@ -28,10 +32,16 @@ struct TermSize {
     rows: u16,
 }
 
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct ViewOffset {
+    line: usize,
+    wrap: usize,
+}
+
 struct EditorState {
     file_text: Rope,
     /// first line in file to draw
-    view_offset: usize,
+    view_offset: ViewOffset,
     cursor_position: CursorPosition,
     term_size: TermSize,
 }
@@ -44,13 +54,21 @@ impl EditorState {
 
         EditorState {
             file_text,
-            view_offset: 0,
+            view_offset: ViewOffset { line: 0, wrap: 0 },
             cursor_position: CursorPosition {
                 char: 0,
                 target_col: None,
             },
             term_size: TermSize { cols, rows },
         }
+    }
+
+    fn visual_lines_in_range(&self, range: std::ops::Range<usize>) -> usize {
+        range
+            .map(|line_idx| {
+                (self.file_text.line(line_idx).len_chars() / self.term_size.cols as usize) + 1
+            })
+            .sum::<usize>()
     }
 
     fn get_cursor_visual_pos(&self) -> (u16, u16) {
@@ -61,12 +79,12 @@ impl EditorState {
             .try_into()
             .unwrap();
 
-        let visual_lines_above: u16 = (self.view_offset..line)
-            .map(|line_idx| {
-                (self.file_text.line(line_idx).len_chars() / self.term_size.cols as usize) + 1
-            })
-            .sum::<usize>()
+        let visual_lines_above: u16 = self
+            .visual_lines_in_range(self.view_offset.line..line)
+            // TODO: should this be in visual_lines_in_range? or is it because terminal size is 1-based?
             .add(1)
+            // account for the visual lines of the first line not shown
+            .sub(self.view_offset.wrap)
             .try_into()
             .unwrap();
         let breaks_in_curr_line =
@@ -74,6 +92,61 @@ impl EditorState {
         let row = visual_lines_above + breaks_in_curr_line as u16;
 
         (col, row)
+    }
+
+    /// Number of term rows a line takes up when wrapped
+    fn line_visual_height(&self, line_idx: usize) -> usize {
+        self.file_text.line(line_idx).len_chars() / self.term_size.cols as usize
+    }
+
+    /// Returns the view offset `distance` term rows up from the char_idx represented by start
+    fn offset_at_visual_distance_up(&self, start: usize, distance: usize) -> ViewOffset {
+        let start_line = self.file_text.char_to_line(start);
+        let start_wrap =
+            (self.file_text.line_to_char(start_line) - start) / self.term_size.cols as usize;
+
+        // TODO: this code assumes start is a line_idx, but it should take char_idx
+        // also, we need to account for wrapping in the current line, as that char_idx may not
+        // align with a line start
+        let (logical_line, visual_distance) = (start_line..0)
+            // skip current line, we account for it by using start_wrap in the fold_while acc
+            .skip(1)
+            .map(|line_idx| self.line_visual_height(line_idx))
+            .fold_while((0, start_wrap), |(logi_acc, visu_acc), x| {
+                let logi_next = logi_acc + 1;
+                let visu_next = visu_acc + x;
+                if visu_next > distance {
+                    Done((logi_next, visu_next))
+                } else {
+                    Continue((logi_next, visu_next))
+                }
+            })
+            .into_inner();
+
+        if visual_distance < distance {
+            ViewOffset { line: 0, wrap: 0 }
+        } else {
+            ViewOffset {
+                line: logical_line,
+                wrap: visual_distance - distance,
+            }
+        }
+    }
+
+    // TODO: better name?
+    fn ensure_cursor_in_view(&mut self) {
+        // lower here means visually lower on the screen, not lower number
+        let lower_bound = self.offset_at_visual_distance_up(self.cursor_position.char, SCROLLOFF);
+        let upper_bound = self.offset_at_visual_distance_up(
+            self.cursor_position.char,
+            self.term_size.rows as usize - SCROLLOFF,
+        );
+
+        if self.view_offset < upper_bound {
+            self.view_offset = upper_bound
+        } else if self.view_offset > lower_bound {
+            self.view_offset = lower_bound
+        }
     }
 
     fn cursor_left(&mut self) {
@@ -153,22 +226,6 @@ impl EditorState {
             }
         }
     }
-
-    fn ensure_cursor_in_view(&mut self) {
-        let line = self.file_text.char_to_line(self.cursor_position.char);
-        let delta: isize = line as isize - self.view_offset as isize;
-
-        if line < SCROLLOFF {
-            return;
-        }
-
-        if delta < SCROLLOFF as isize {
-            self.view_offset -= (SCROLLOFF as isize - delta) as usize;
-        } else if delta > (self.term_size.rows as isize - SCROLLOFF as isize) {
-            self.view_offset +=
-                (delta - (self.term_size.rows as isize - SCROLLOFF as isize)) as usize
-        }
-    }
 }
 
 fn init_tui() -> io::Result<Term> {
@@ -222,7 +279,7 @@ fn layout(state: &EditorState) -> Vec<RopeSlice<'_>> {
     let mut visual_lines = Vec::with_capacity(state.term_size.rows.into());
     let mut push_count = 0;
 
-    'outer: for line in state.file_text.lines().skip(state.view_offset) {
+    'outer: for line in state.file_text.lines().skip(state.view_offset.line) {
         let line = line.slice(..(line.len_chars().saturating_sub(1)));
         let wrap_count = (line.len_chars() / width) + 1;
 
@@ -236,11 +293,10 @@ fn layout(state: &EditorState) -> Vec<RopeSlice<'_>> {
         for points in breakpoints.windows(2) {
             visual_lines.push(line.slice(points[0]..points[1]));
             push_count += 1;
-
-            if push_count == state.term_size.rows.into() {
-                // we have enough visual lines to fill the viewport
-                break 'outer;
-            }
+        }
+        if push_count - state.view_offset.wrap > state.term_size.rows.into() {
+            // we have enough visual lines to fill the viewport
+            break 'outer;
         }
     }
 
@@ -251,7 +307,7 @@ fn layout(state: &EditorState) -> Vec<RopeSlice<'_>> {
 fn test_layout() {
     let state = EditorState {
         file_text: Rope::from_str("\n\n1234567\n1234\n\n"),
-        view_offset: 2,
+        view_offset: ViewOffset { line: 2, wrap: 0 },
         cursor_position: CursorPosition {
             char: 3,
             target_col: None,
