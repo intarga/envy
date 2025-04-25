@@ -5,7 +5,7 @@ use itertools::{
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Stdout, Write, stdin, stdout},
-    ops::{Add, Sub},
+    ops::Add,
 };
 use termion::{
     event::Key,
@@ -13,6 +13,7 @@ use termion::{
     raw::{IntoRawMode, RawTerminal},
     screen::{AlternateScreen, IntoAlternateScreen},
 };
+use tracing::info;
 
 // TODO: operate on graphemes not chars
 
@@ -41,7 +42,6 @@ struct ViewOffset {
 
 struct EditorState {
     file_text: Vec<String>,
-    /// first line in file to draw
     view_offset: ViewOffset,
     cursor_position: CursorPosition,
     term_size: TermSize,
@@ -86,7 +86,7 @@ impl EditorState {
             // TODO: should this be in visual_lines_in_range? or is it because terminal size is 1-based?
             .add(1)
             // account for the visual lines of the first line not shown
-            .sub(self.view_offset.wrap)
+            .saturating_sub(self.view_offset.wrap)
             .try_into()
             .unwrap();
         let breaks_in_curr_line = self.cursor_position.char / self.term_size.cols as usize;
@@ -97,42 +97,46 @@ impl EditorState {
 
     /// Number of term rows a line takes up when wrapped
     fn line_visual_height(&self, line_idx: usize) -> usize {
-        self.file_text[line_idx].len() + 1 / self.term_size.cols as usize
+        ((self.file_text[line_idx].len() + 1) / self.term_size.cols as usize) + 1
     }
 
     /// Returns the view offset `distance` term rows up from the offset represented by start
     fn offset_at_visual_distance_up(&self, start: ViewOffset, distance: usize) -> ViewOffset {
-        // let start_line = self.file_text.char_to_line(start);
-        // let start_wrap =
-        //     (self.file_text.line_to_char(start_line) - start) / self.term_size.cols as usize;
-
-        let (logical_line, visual_distance) = (start.line..0)
-            // skip current line, we account for it by using start_wrap in the fold_while acc
-            .skip(1)
+        info!("  IN OFFSET ---");
+        info!("  start: {start:?}");
+        info!("  distance: {distance:?}");
+        let (logical_distance, visual_distance) = (0..start.line)
+            .rev()
             .map(|line_idx| self.line_visual_height(line_idx))
             .fold_while((0, start.wrap), |(logi_acc, visu_acc), x| {
+                info!("    IN ITERATION ---");
+                info!("    logi_acc: {logi_acc:?}");
+                info!("    visu_acc: {visu_acc:?}");
+                info!("    x: {x:?}");
                 let logi_next = logi_acc + 1;
                 let visu_next = visu_acc + x;
-                if visu_next > distance {
+                if visu_next >= distance {
                     Done((logi_next, visu_next))
                 } else {
                     Continue((logi_next, visu_next))
                 }
             })
             .into_inner();
+        info!("  logical_distance: {logical_distance:?}");
+        info!("  visual_distance: {visual_distance:?}");
 
         if visual_distance < distance {
             ViewOffset { line: 0, wrap: 0 }
         } else {
             ViewOffset {
-                line: logical_line,
+                line: start.line - logical_distance,
                 wrap: visual_distance - distance,
             }
         }
     }
 
-    // TODO: better name?
-    fn ensure_cursor_in_view(&mut self) {
+    fn ensure_view_contains_cursor(&mut self) {
+        info!("IN ENSURE ---");
         let offset_at_cursor = ViewOffset {
             line: self.cursor_position.line,
             wrap: (self.file_text[self.cursor_position.line].len() + 1)
@@ -146,6 +150,7 @@ impl EditorState {
             offset_at_cursor,
             self.term_size.rows as usize - SCROLLOFF,
         );
+        info!("lower_bound: {lower_bound:?}\nupper_bound: {upper_bound:?}");
 
         if self.view_offset < upper_bound {
             self.view_offset = upper_bound
@@ -265,15 +270,13 @@ fn process_keypress(key: Key, state: &mut EditorState) -> bool {
 fn layout(state: &EditorState) -> Vec<&str> {
     let width = state.term_size.cols as usize;
     let mut visual_lines = Vec::with_capacity(state.term_size.rows.into());
-    let mut push_count = 0;
+    let mut push_count: usize = 0;
 
     for line in state.file_text.iter().skip(state.view_offset.line) {
         if line.len() < width {
             visual_lines.push(line.as_str());
             push_count += 1
         } else {
-            // let wrap_count = ((line.len() + 1) / width) + 1;
-
             let mut rest = line.as_str();
             let mut char_indices = line.char_indices();
             while let Some((i, _)) = char_indices.nth(width) {
@@ -288,7 +291,7 @@ fn layout(state: &EditorState) -> Vec<&str> {
             }
         }
 
-        if push_count - state.view_offset.wrap > state.term_size.rows.into() {
+        if push_count.saturating_sub(state.view_offset.wrap) > state.term_size.rows as usize {
             // we have enough visual lines to fill the viewport
             break;
         }
@@ -299,12 +302,7 @@ fn layout(state: &EditorState) -> Vec<&str> {
 
 #[test]
 fn test_layout() {
-    // let file_text = BufReader::new(File::open(path).unwrap())
-    //     .lines()
-    //     .collect::<Result<Vec<String>, std::io::Error>>()
-    //     .unwrap();
     let state = EditorState {
-        // file_text: Rope::from_str("\n\n1234567\n1234\n\n"),
         file_text: "\n\n1234567\n1234\n\n"
             .lines()
             .map(|l| l.to_string())
@@ -348,7 +346,17 @@ fn render_editor(state: &EditorState, term: &mut Term) {
     term.flush().unwrap();
 }
 
+fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
+    let file_appender = tracing_appender::rolling::never(".", "test.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    tracing_subscriber::fmt().with_writer(non_blocking).init();
+
+    guard
+}
+
 fn main() {
+    let _tracing_guard = init_tracing();
+
     init_panic_hook().unwrap();
 
     let stdin = stdin();
@@ -363,7 +371,7 @@ fn main() {
     for c in stdin.keys() {
         let quit = process_keypress(c.unwrap(), &mut state);
 
-        state.ensure_cursor_in_view();
+        state.ensure_view_contains_cursor();
 
         if quit {
             break;
